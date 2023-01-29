@@ -1,0 +1,229 @@
+---
+title: "1_run_module_analysis"
+author: "Joshua Levy"
+date: "7/4/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Calculate similarity matrix
+```{r}
+library(tidyverse)
+library(rmcorr)
+library(corrr)
+calc.similarity<-function(Xy, batch_id){
+  Xy<- as.data.frame(t(Xy))
+  genes<-colnames(Xy)
+  N<-length(genes)
+  cor.mat<-matrix(1,nrow=N,ncol=N)
+  colnames(cor.mat)<-genes
+  rownames(cor.mat)<-genes
+  for (i in genes){
+    for (j in genes){
+      if (i!=j){
+        cor.mat[i,j]<-rmcorr(batch_id,i,j,Xy)$r
+        cor.mat[j,i]<-cor.mat[i,j]
+      }
+    }
+  }
+  return(cor.mat)
+}
+
+calc.similarity.condition<-function(Xy, batch_id, y){
+  Xy<- as.data.frame(t(Xy))
+  genes<-colnames(Xy)
+  N<-length(genes)
+  C<-matrix(1,nrow=N,ncol=N)
+  colnames(C)<-genes
+  rownames(C)<-genes
+  S<-C
+  D<-C
+  R1<-C
+  R2<-C
+  for (i in genes){
+    for (j in genes){
+      if (i!=j){
+        r1_<-rmcorr(batch_id[y==0],i,j,Xy[y==0,])
+        r2_<-rmcorr(batch_id[y==1],i,j,Xy[y==1,])
+        r1<-r1_$r
+        r2<-r2_$r
+        v1<-(abs(diff(r1_$CI))/2)**2
+        v2<-(abs(diff(r2_$CI))/2)**2
+        C[i,j]<-abs(r1+r2)/sqrt(v1+v2)
+        C[j,i]<-C[i,j]
+        S[i,j]<-abs(abs(r1)-abs(r2))/sqrt(v1+v2)
+        S[j,i]<-S[i,j]
+        D[i,j]<-abs(abs(r1)+abs(r2)-abs(r1+r2))/sqrt(v1+v2)
+        D[j,i]<-D[i,j]
+        R1[i,j]<-R1[j,i]<-r1
+        R2[i,j]<-R2[j,i]<-r2
+      }
+    }
+  }
+  return(list(C=C,S=S,D=D,R1=R1,R2=R2))
+}
+```
+
+
+```{r}
+library(corrplot)
+library(patchwork)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(reticulate)
+data<-readRDS("../../data/dsp_data.rds")
+```
+
+# C conserved -> both mets/no mets
+# S specific -> either mets or no mets
+# D differential -> different between mets/no mets
+```{r}
+library(comprehenr)
+library(patchwork)
+macro_annot<-"intra"
+target<-"ln_only"#"any_mets"# need modify
+graphs<-list()
+cor.lists<-list()
+mats<-list()
+for (target in c("any_mets","ln_only","Distant_Mets")){
+graphs[[target]]<-list()
+cor.lists[[target]]<-list()
+mats[[target]]<-list()
+for (macro_annot in c("intra","inter","away")){
+  dat<-data$igg
+  if (target=="ln_only"){
+    dat$expr<-dat$expr[!dat$pheno$Distant_Mets,]
+    dat$pheno<-dat$pheno[!dat$pheno$Distant_Mets,]
+  } else if (target=="Distant_Mets"){
+    dat$expr<-dat$expr[!dat$pheno$ln_only,]
+    dat$pheno<-dat$pheno[!dat$pheno$ln_only,]
+  }
+  dat$expr<-dat$expr[dat$pheno$macro_annot==macro_annot,]
+  dat$pheno<-dat$pheno[dat$pheno$macro_annot==macro_annot,]
+  cor.list<-calc.similarity.condition(t(dat$expr %>% select(-contains("IgG"))),factor(dat$pheno$batch),dat$pheno[[target]])
+  
+  p<-0.94
+  Cmat<-cor.list$C>quantile(cor.list$C,p)
+  Smat<-cor.list$S>quantile(cor.list$S,p)
+  Dmat<-cor.list$D>quantile(cor.list$D,p)
+  cor.lists[[target]][[macro_annot]]<-cor.list
+  mats[[target]][[macro_annot]]<-list(C=Cmat,S=Smat,D=Dmat,dat=dat)
+  network <- graph_join(graph_join(as_tbl_graph(graph_from_adjacency_matrix(Cmat,mode="undirected")) %>% activate("edges") %>% mutate(edge_color="C"),
+                  as_tbl_graph(graph_from_adjacency_matrix(Smat,mode="undirected")) %>% activate("edges") %>% mutate(edge_color="S")),
+                  as_tbl_graph(graph_from_adjacency_matrix(Dmat,mode="undirected")) %>% activate("edges") %>% mutate(edge_color="D")) %>%   
+                   activate("edges") %>% filter(from!=to) %>% activate("nodes") %>%  mutate(size = centrality_degree(mode = 'in')+centrality_degree(mode = 'out')) %>% filter(size>0) #&Dmat
+  
+  graphs[[target]][[macro_annot]]<-ggraph(network, 'kk') + 
+      geom_edge_fan(aes(alpha = stat(index),color=edge_color), show.legend = F) +
+      theme_graph(foreground = 'steelblue', fg_text_colour = 'white')+
+    geom_node_label(aes(label = name),label.size=0.05) + facet_edges(~edge_color)
+}
+}
+```
+
+# results
+```{r}
+if (F){
+  graphs$any_mets$inter / graphs$ln_only$inter / graphs$Distant_Mets$inter
+  graphs$any_mets$intra / graphs$any_mets$inter / graphs$any_mets$away
+  graphs$ln_only$intra / graphs$ln_only$inter / graphs$ln_only$away
+  graphs$Distant_Mets$intra / graphs$Distant_Mets$inter / graphs$Distant_Mets$away
+  saveRDS(graphs,"../../results/3_gene_module/graphs.rds")
+}
+
+saveRDS(list(cor.lists=cor.lists,mats=mats),"../../results/3_gene_module/cor.lists_mats.rds")
+```
+
+# visualize
+```{r}
+final.dfs.cor<-list()
+for (nm1 in names(cor.lists)){
+  final.dfs.cor[[nm1]]<-list()
+  for (nm2 in names(cor.lists[[nm1]])){
+    tmp.dfs<-list()
+    for (nm in c("C","D","S")){
+      tmp.dfs[[nm]]<-as.data.frame(cor.lists[[nm1]][[nm2]][[nm]]) %>% tibble::rownames_to_column(var = "Row") %>%  pivot_longer(cols=colnames(cor.lists[[nm1]][[nm2]][[nm]]))
+      tmp.dfs[[nm]][[nm]]<-tmp.dfs[[nm]]$value
+      tmp.dfs[[nm]]<-tmp.dfs[[nm]] %>% select(-value)
+    }
+    final.dfs.cor[[nm1]][[nm2]]<-Reduce(function(x, y) merge(x, y, all=TRUE), tmp.dfs) %>% mutate(R1= sapply(mapply(list, Row, name, SIMPLIFY=F),function(x){cor.lists[[nm1]][[nm2]]$R1[x[[1]],x[[2]]]}),
+                                                                                                                                                                        R2=sapply(mapply(list, Row, name, SIMPLIFY=F),function(x){cor.lists[[nm1]][[nm2]]$R2[x[[1]],x[[2]]]})) %>% filter(Row!=name)
+  }
+}
+
+saveRDS(final.dfs.cor,"../../results/3_gene_module/diff.coexp.res.rds")
+
+add.names<-function(x,nm){
+  names(x)<-nm
+  return(x)
+}
+
+final.dfs.cor<-list()
+for (nm1 in names(cor.lists)){
+  final.dfs.cor[[nm1]]<-list()
+  for (nm2 in names(cor.lists[[nm1]])){
+    # final.dfs.cor[[nm1]][[nm2]]<-list()
+    df.tmp<-list()
+    for (nm in c("C","D","S")){
+      G<-graph_from_adjacency_matrix(cor.lists[[nm1]][[nm2]][[nm]],mode="undirected",weighted=T,diag=F)
+      G2<-graph_from_adjacency_matrix(mats[[nm1]][[nm2]][[nm]],mode="undirected",weighted=NULL,diag=F)
+      df.tmp[[nm]]<-data.frame(betweenness=G2 %>% betweenness(),
+                 evec=evcent(G)$vector,
+                 # in_deg=G %>% igraph::degree(mode="in"),
+                 # out_deg=G %>% igraph::degree(mode="out"),
+                 deg=G2 %>% igraph::degree(mode="all"),
+                 closeness= G %>% closeness())  #%>% arrange(desc(evec))
+
+      
+    }
+    final.dfs.cor[[nm1]][[nm2]]<-data.frame(C=add.names(df.tmp$C$evec,rownames(df.tmp$C)),
+                                            D=add.names(df.tmp$D$evec,rownames(df.tmp$D)),
+                                            S=add.names(df.tmp$S$evec,rownames(df.tmp$S))) %>% tibble::rownames_to_column(var = "Marker") 
+    
+  }
+  
+}
+
+saveRDS(final.dfs.cor,"../../results/3_gene_module/centralities.rds")
+
+```
+
+# calculate centrality of each marker separately for C/D/S by macroarchitecture
+```{r}
+centralities<-final.dfs.cor
+for (nm1 in names(centralities)){
+  for (nm2 in names(centralities[[nm1]])){
+    centralities[[nm1]][[nm2]][,-1]<-sapply(-centralities[[nm1]][[nm2]][,-1],rank,1)
+  }
+}
+
+target<-"Distant_Mets"
+
+ps<-list()
+for (target in c("any_mets","ln_only","Distant_Mets")){
+  tmp.df.C<-Reduce(function(x, y) merge(x, y, by="Marker", all=TRUE),list(intra=centralities[[target]]$intra %>% select(Marker,C),inter=centralities[[target]]$inter %>% select(Marker,C),away=centralities[[target]]$away %>% select(Marker,C))) %>% mutate(intra=C.x,inter=C.y,away=C) %>% select(-contains("C")) %>% pivot_longer(-Marker) %>% mutate(name=as.numeric(ordered(name,levels=c("intra","inter","away"))))
+filter.markers<-(tmp.df.C %>% group_by(Marker) %>% summarize(mn=mean(value),rg=max(value)-min(value)) %>% filter(mn<=10|rg>20))$Marker
+  pC<-tmp.df.C %>% filter(Marker%in%filter.markers) %>% ggplot(aes(x=name,y=value,label=Marker,color=Marker)) + geom_line(show.legend=F) + geom_label(show.legend=F) + theme_classic()  + scale_x_continuous(labels=c("Intra", "Inter","Away"),breaks=1:3, limits=c(0.5,3.5))+xlab("")+ylab("Centrality Rank")
+  
+  tmp.df.D<-Reduce(function(x, y) merge(x, y, by="Marker", all=TRUE),list(intra=centralities[[target]]$intra %>% select(Marker,D),inter=centralities[[target]]$inter %>% select(Marker,D),away=centralities[[target]]$away %>% select(Marker,D))) %>% mutate(intra=D.x,inter=D.y,away=D) %>% select(-contains("D")) %>% pivot_longer(-Marker) %>% mutate(name=as.numeric(ordered(name,levels=c("intra","inter","away"))))
+  filter.markers<-(tmp.df.D %>% group_by(Marker) %>% summarize(mn=mean(value),rg=max(value)-min(value)) %>% filter(mn<=10|rg>20))$Marker
+  pD<-tmp.df.D %>% filter(Marker%in%filter.markers) %>% ggplot(aes(x=name,y=value,label=Marker,color=Marker),show.legend=F) + geom_line(show.legend=F) + geom_label(show.legend=F) + theme_classic()  + scale_x_continuous(labels=c("Intra", "Inter","Away"),breaks=1:3, limits=c(0.5,3.5))+xlab("Macroarchitecture")+ylab("")
+  
+  tmp.df.S<-Reduce(function(x, y) merge(x, y, by="Marker", all=TRUE),list(intra=centralities[[target]]$intra %>% select(Marker,S),inter=centralities[[target]]$inter %>% select(Marker,S),away=centralities[[target]]$away %>% select(Marker,S))) %>% mutate(intra=S.x,inter=S.y,away=S) %>% select(-contains("S")) %>% pivot_longer(-Marker) %>% mutate(name=as.numeric(ordered(name,levels=c("intra","inter","away"))))
+  filter.markers<-(tmp.df.S %>% group_by(Marker) %>% summarize(mn=mean(value),rg=max(value)-min(value)) %>% filter(mn<=10|rg>20))$Marker
+  pS<-tmp.df.S %>% filter(Marker%in%filter.markers) %>% ggplot(aes(x=name,y=value,label=Marker,color=Marker),show.legend=F) + geom_line(show.legend=F) + geom_label(show.legend=F) + theme_classic()  + scale_x_continuous(labels=c("Intra", "Inter","Away"),breaks=1:3, limits=c(0.5,3.5))+xlab("")+ylab("")
+  
+  ps[[target]]<-(pC+pD+pS)
+}
+ps$any_mets
+ps$ln_only
+ps$Distant_Mets
+
+```
+
+
+

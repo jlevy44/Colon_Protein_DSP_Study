@@ -1,0 +1,144 @@
+---
+title: "1_analysis"
+author: "Joshua Levy"
+date: "7/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# imports
+```{r}
+library(reticulate)
+library(tidyverse)
+library(brms)
+library(stringr)
+library(bayestestR)
+library(bayesplot)
+
+get.hdi<-function(x,ci=0.9){
+  hdi.val<-hdi(x, ci=ci)
+  return(c(mean(x),median(x),sd(x),mad(x),hdi.val$CI_low,hdi.val$CI_high))
+}
+
+python<-use_python(conda_python(envname = "py37", conda = "auto"))
+pd<-import("pandas")
+sklearn<-import("sklearn")
+pickle<-import("pickle")
+py <- import_builtins()
+```
+
+# overall
+```{r}
+data<-readRDS("../../data/dsp_data.rds")
+dat<-cbind(data$igg$expr,data$igg$pheno)
+dat$sex<-as.numeric(dat$sex=="M")
+for (k in unique(dat$macro_annot)){
+    dat[[str_glue("macro_{k}")]]=as.numeric(dat$macro_annot==k)
+}
+
+```
+
+# extract interactions precomputed using the jupyter notebook and evaluate using BGLMM 
+```{r}
+library(future.apply)
+
+macros<-c("intra","inter","away")
+outcomes<-c("any_mets","ln_only","Distant_Mets")
+form.strs<-list()
+for (macro in macros){
+  form.strs[[macro]]<-list()
+  for (outcome in outcomes){
+    form.strs[[macro]][[outcome]]<-pd$read_pickle(str_glue("./analyses/4_MEML/pickle_res/form_str-{macro}-{outcome}.pkl"))
+  }
+}
+dat.orig<-dat
+fit_model<-function(dat.orig,macro,outcome,p.thres=0.95,n.thres=20,par.ratio=0.05,prior_var=10){
+    dat<-dat.orig
+    form.str<-form.strs[[macro]][[outcome]]
+    use_macro<-(macro=="overall")
+    if (!use_macro){
+      dat<-dat %>% filter(macro_annot==macro)
+    }
+    if (outcome=="ln_only"){
+      dat<-dat %>% filter(Distant_Mets==0)
+    } else if (outcome=="Distant_Mets"){
+      dat<-dat %>% filter(ln_only==0)
+    }
+    fit <- brm(paste(outcome,"~",form.str[1],"+",form.str[2],"+(1|batch)",sep=""),#batch
+                          dat ,
+                          cores = 4,
+                          seed=42, 
+                          family=bernoulli,
+                          prior=prior_string(str_glue("horseshoe(df = 3, par_ratio = {par.ratio})")),
+                          control=list(adapt_delta=0.9),
+                          future=F,
+                   save_pars = save_pars(all = TRUE),
+                   iter=2000)
+    fit.df<-as.data.frame(fit) %>% select(starts_with("b_"),-contains("Intercept"))
+    new.terms<-union(str_remove((describe_posterior(fit.df) %>% filter(pd>=p.thres))$Parameter,"b_"),
+    str_remove((describe_posterior(fit.df) %>% arrange(desc(pd)))$Parameter[1:n.thres],"b_"))
+    main.effects<-unique(unlist(str_split(new.terms[grepl(":",new.terms)],":")))
+    dat.new<-dat %>% mutate_at(main.effects,scale)
+    main.effects<-main.effects[!main.effects%in%new.terms]
+    new.terms<-unique(c(main.effects,new.terms,"age","sex"))
+    form<-as.formula(paste(outcome,"~",paste(new.terms,collapse="+"),"+(1|batch)"))
+    fit.final <- brm(form, dat.new,
+                  cores = 4,
+                  seed=42, 
+                  family=bernoulli,
+                  future=F,
+                  prior=prior_string(str_glue("normal(0,{prior_var})")),
+           save_pars = save_pars(all = TRUE),
+           iter=2000)
+    fit.final$outcome<-outcome
+    fit.final$macro<-macro
+
+  return(list(fit=fit,fit.final=fit.final,dat=dat))
+}
+
+mods<-list()
+for (macro in macros){
+  mods[[macro]]<-list()
+  for (outcome in outcomes){
+    mods[[macro]][[outcome]]<-fit_model(dat.orig,macro,outcome,0.9,10,par.ratio=0.05,prior_var = 30)
+  }
+}
+
+mods.df<-list()
+for (macro in macros){
+  mods.df[[macro]]<-list()
+  for (outcome in outcomes){
+    print(c(macro,outcome))
+    mods.df[[macro]][[outcome]]<-as.data.frame(mods[[macro]][[outcome]]$fit.final) %>% select(starts_with("b_"),-contains("Intercept"))
+  }
+}
+
+saveRDS(mods.df,"../../results/5_eff_mod/mods_df.rds")
+
+fit.final.df<-mods.df[[macro]][[outcome]] 
+describe_posterior(fit.final.df) %>% mutate(p=2*(1-pd),log2FoldChange=Median,Parameter=str_replace(Parameter,"b_","")) %>% select(Parameter,CI_low,CI_high,p) %>% arrange(p)
+fit.final.df<-mods.df[[macro]][[outcome]] 
+mcmc_intervals(fit.final.df[,(describe_posterior(fit.final.df) %>% arrange(desc(pd)))$Parameter])
+```
+
+
+```{r}
+mods$intra$any_mets
+mods$intra$ln_only
+mods$intra$Distant_Mets
+mods$inter$ln_only
+mods$inter$Distant_Mets
+mods$away$Distant_Mets
+mods$away$ln_only
+mods$away$any_mets
+form.strs$intra$any_mets
+mods$overall$any_mets
+mods$overall$ln_only
+mods$overall$Distant_Mets
+
+
+```
+

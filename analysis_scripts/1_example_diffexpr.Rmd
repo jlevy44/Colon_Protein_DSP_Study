@@ -1,0 +1,240 @@
+---
+title: "1_diff_expr"
+author: "Joshua Levy"
+date: "7/4/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r}
+library(tidyverse)
+library(brms)
+library(emmeans)
+library(bayestestR)
+library(tidybayes)
+library(comprehenr)
+library(stringr)
+```
+
+# load data
+```{r}
+data<-readRDS("../../data/dsp_data.rds")
+targets<-c("any_mets","Distant_Mets","ln_only","MLH1","mo(node_stage)")
+normalizations<-c("igg","hk")
+control.markers<-c(colnames(data$igg$expr %>% select(contains("IgG"))))
+available.markers<-setdiff(names(data$igg$expr),control.markers)
+```
+
+# load options
+```{r}
+marker<-"CD8"
+ratio.markers<-setdiff(c(c(available.markers),""),c(marker))
+normalization<-"igg"
+target<-"any_mets"
+covar<-"no_covar"
+covariates<-c("age","sex")
+if (length(covariates)>0){covar<-"covar"}
+cell.type<-"no_celltype"
+if (length(control.markers)>0){cell.type<-"celltype"}
+interactions<-c()
+```
+
+# run model
+```{r}
+if.else<-function(c_,x,y){if(c_){return(x)}; return(y)}
+run.mod<-function(marker,norm="igg",target="distant_mets",mlh1_int=F,ratio.marker=""){
+  control.text<-paste("+",control.markers,sep="",collapse="+")
+  covariate.text<-paste("+",setdiff(covariates,c(target)),sep="",collapse="+")
+  if (length(control.markers)==0){
+    control.text<-""
+  }
+  if (length(covariates)==0){
+    covariate.text<-""
+  }
+  dat<-cbind(data[[norm]]$pheno,data[[norm]]$expr)
+  if (target%in%c("ln_only","Distant_Mets")){
+    dat<-dat[dat[,target]==1 | dat[,"any_mets"]==0,]
+  }
+  ratio.text<-if.else(ratio.marker!="",paste("+offset(",ratio.marker,")",sep=""),"")
+  mod<-brm(as.formula(paste(marker,"~",target,"*macro_annot",if.else(mlh1_int,"*","+"),"MLH1",control.text,covariate.text,ratio.text,"+(1|patient_id)",sep="")),data=dat,seed=42,cores=4,prior=prior(normal(0,5)),refresh=0,algorithm = "sampling",iter=2000,backend = "rstan", silent=T,future=T)
+  mod$marker<-marker
+  mod$mlh1_int<-mlh1_int
+  mod$target<-target
+  mod$ratio.marker<-ratio.marker
+  return(mod)
+}
+
+return.res<-function(mod){
+  x<-mod$marker
+  target<-mod$target
+  mlh1_int<-mod$mlh1_int
+  ratio.marker<-mod$ratio.marker
+  rg<-ref_grid(mod)
+  if (grepl("node_stage",target)){target<-"node_stage"}
+  em<-emmeans(rg,as.formula(paste(str_glue("~{target}|macro_annot{if.else(mlh1_int,'*MLH1','')}"))))
+  cont<-contrast(em,method="pairwise")
+  cont_posterior_macro <- gather_emmeans_draws(cont)[,c("contrast","macro_annot",if.else(mlh1_int,"MLH1",c()),".draw",".value")] %>% pivot_wider(names_from=c("contrast","macro_annot",if.else(mlh1_int,"MLH1",c())),values_from=".value")
+  
+  if (T){
+    em<-emmeans(rg,as.formula(paste(str_glue("~macro_annot|{target}{if.else(mlh1_int,'*MLH1','')}"))))
+  cont<-contrast(em,method="pairwise")
+  cont_posterior_targ <- gather_emmeans_draws(cont)[,c("contrast",target,if.else(mlh1_int,"MLH1",c()),".draw",".value")] %>% pivot_wider(names_from=c("contrast",target,if.else(mlh1_int,"MLH1",c()),),values_from=".value")#,method="consec"
+  
+  res_<-rbind(as.data.frame(describe_posterior(cont_posterior_macro,ci=0.95))[-1,c("Parameter","Median","CI_low","CI_high","pd")] %>% mutate(pd=2*(1-pd)),
+        as.data.frame(describe_posterior(cont_posterior_targ,ci=0.95))[-1,c("Parameter","Median","CI_low","CI_high","pd")] %>% mutate(pd=2*(1-pd)))
+  }
+  else {
+    res_<-as.data.frame(describe_posterior(cont_posterior_macro,ci=0.95))[-1,c("Parameter","Median","CI_low","CI_high","pd")] %>% mutate(pd=2*(1-pd))
+  }
+  res_$gene<-x
+  res_$ratio.gene<-ratio.marker
+  res_$target<-target
+  res_$mlh1_int<-mlh1_int
+  return(list(res=res_,posterior_macro=cont_posterior_macro,posterior_target=cont_posterior_targ))
+}
+
+run.workflow<-function(marker,norm="igg",target="distant_mets",mlh1_int=F,ratio.marker=""){
+  return(return.res(run.mod(marker,norm,target,mlh1_int,ratio.marker))$res)
+}
+```
+
+# example run
+```{r, message=FALSE, warning=FALSE}
+library(future)
+library(tictoc)
+library(comprehenr)
+
+plan(multisession,workers=12)
+res_new<-do.call(rbind,future.apply::future_lapply(new.markers<-c("CD8","CD4","CD3","CD11c",""),function(x) run.workflow("CD66b",normalization,target,F,x),future.seed = 42L))
+toc()
+
+res_tmp<-run.mod("CD8",normalization,target,F,"CD66b")
+return.res(res_tmp)$res
+res_tmp$mlh1_int
+
+tic("series")
+plan(sequential)
+res_new<-future.apply::future_lapply(c("CD8","CD4","CD3"),function(x) run.mod(x,normalization,target,T),future.seed = 42L)
+toc()
+
+tic("series_v2")
+res_new<-to_list(for (marker in c("CD8","CD4","CD3")){run.mod(marker,normalization,target,T)})
+toc()
+
+names(res_new)<-c("CD8","CD4","CD3")
+```
+
+# let's check out results
+```{r}
+library(emmeans)
+library(tidybayes)
+library(bayestestR)
+library(tidyverse)
+library(bayesplot)
+
+```
+
+# return results
+```{r}
+results<-return.res(res_new$CD66b)
+```
+
+# results, differencecs in marker expression by target (e.g., mets vs no mets) given macro-architecture (intra, inter, away)
+```{r}
+results$res %>% filter(startsWith(Parameter,"0 - 1"))
+```
+
+```{r}
+results$res %>% filter(startsWith(Parameter,"0 - 1"))
+```
+
+# results, differencecs in marker expression by macro-architecture (intra, inter, away), reported by target (e.g., mets vs no mets) 
+```{r}
+results$res %>% filter(!startsWith(Parameter,"1 - 0"))
+```
+
+
+# for command line for scaling
+```{r}
+args = commandArgs(trailingOnly=TRUE)
+normalization<-normalizations[as.integer(args[1])]
+target<-targets[as.integer(args[2])]
+marker<-available.markers[as.integer(args[3])]
+saveRDS(run.mod(marker,normalization,target),str_glue("./models/{normalization}--{target}--{marker}.rds"))
+```
+
+```{r}
+library(future)
+library(future.apply)
+plan(multisession,workers=12)
+args = commandArgs(trailingOnly=TRUE)
+target<-targets[as.integer(args[1])]
+marker<-available.markers[as.integer(args[2])]
+mlh1_int<-as.integer(args[3])
+res_new<-do.call(rbind,future_lapply(ratio.markers,function(x) run.workflow(marker,"igg",target,mlh1_int==1,x),future.seed = 42L))
+saveRDS(res_new,str_glue("./results_v2/{normalization}--{target}--{marker}.rds"))
+```
+
+# running same analyses with lme4, not included in final study, opting for bayesian methods
+```{r}
+library(EnhancedVolcano)
+ratio.tests<-list()
+for (ratio.marker in setdiff(markers,c(control.markers))){
+  emmeans.res<-list()
+  # ratio.marker<-"CD45"
+  for (marker in setdiff(markers,c(control.markers,ratio.marker))){
+    control.text<-paste("+",control.markers,sep="",collapse="+")
+    covariate.text<-paste("+",setdiff(covariates,c(target)),sep="",collapse="+")
+    if (length(control.markers)==0){
+      control.text<-""
+    }
+    if (length(covariates)==0){
+      covariate.text<-""
+    }
+    dat<-cbind(data[[norm]]$pheno,data[[norm]]$expr)
+    if (target%in%c("ln_only","Distant_Mets")){
+      dat<-dat[dat[,target]==1 | dat[,"any_mets"]==0,]
+    }
+    mod<-lmer(as.formula(paste(marker,"~",target,"*macro_annot",control.text,covariate.text,"+offset(",ratio.marker,")+(1|patient_id)",sep="")),data=dat)
+    cont<-emmeans(mod, pairwise~any_mets|macro_annot, data=dat)$contrasts
+    summ.cont<-summary(cont)
+    emmeans.res[[marker]]<-data.frame(marker=rep(marker,length(summ.cont$contrast)),
+                        contrast=summ.cont$contrast,
+                        macro=summ.cont$macro_annot,
+                        estimate=summ.cont$estimate,
+                        p=summ.cont$p.value
+            )
+  }
+  
+  emmeans.res.df<-as.data.frame(do.call(rbind,emmeans.res))
+  ratio.tests[[ratio.marker]]<-emmeans.res.df
+}
+
+```
+
+
+```{r}
+markers
+visualize.volcano<-function(ratio.marker="CD3",macro_="intra"){
+  EnhancedVolcano(emmeans.mini<-ratio.tests[[ratio.marker]] %>% filter(contrast=="0 - 1"&macro==macro_) %>% mutate(log2FoldChange=estimate,pvalue=p),#-log10(
+    lab = rownames(emmeans.mini),
+    pCutoff = (5)*10^(-2),#*nrow(emmeans.mini)
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    pointSize = 4.0,
+    labSize = 6.0,
+    colAlpha = 1,
+    legendPosition = 'right',
+    legendLabSize = 12,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    widthConnectors = 0.75,
+    FCcutoff = 0.4)
+}
+
+```
+
